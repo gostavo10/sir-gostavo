@@ -1,0 +1,26 @@
+# Fly.io — deploy with: fly launch --no-deploy && fly deploy
+app = "combat-chat"
+primary_region = "cdg" # Paris — best latency from Egypt (~40ms)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8080"
+  ADMIN_USER = "za3im"
+  # set the owner password as a secret: fly secrets set ADMIN_PASS="..."
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/healthz"

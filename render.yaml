@@ -1,0 +1,19 @@
+# Render.com — free plan (sleeps after 15 min idle)
+services:
+  - type: web
+    name: combat-chat
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install --no-audit --no-fund --legacy-peer-deps && npm run build
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "20"
+      - key: ADMIN_USER
+        value: za3im
+      - key: ADMIN_PASS
+        sync: false # set it in the Render dashboard — owner login password
