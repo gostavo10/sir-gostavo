@@ -226,6 +226,12 @@ export default function ArenaChat() {
   const [adminPass, setAdminPass] = useState('')
   const [adminBusy, setAdminBusy] = useState(false)
   const [adminError, setAdminError] = useState('')
+  const [globalFrozen, setGlobalFrozen] = useState(false)
+  const [bans, setBans] = useState<{ users: string[]; ips: string[]; onlineIps?: Record<string, string> } | null>(null)
+  const [banName, setBanName] = useState('')
+  const [banIp, setBanIp] = useState('')
+  const [bcText, setBcText] = useState('')
+  const [alsoIp, setAlsoIp] = useState(true)
 
   const socketRef = useRef<ChatSocket | null>(null)
   const audioCtxRef = useRef<AudioContext | null>(null)
@@ -313,23 +319,32 @@ export default function ArenaChat() {
   }, [])
 
   // ---- global lobby join: silent, no codes, no passwords ----
-  const ensureGlobalJoined = useCallback((n: string) => {
-    const nm = n.trim()
-    const s = socketRef.current
-    if (!s || !nm || globalJoinedRef.current) return
-    s.emit(
-      'join-global',
-      { name: nm, adminToken: adminTokenRef.current ?? undefined },
-      (res: GlobalJoinAck) => {
-        if (res.ok) {
-          globalJoinedRef.current = true
-          setGlobalJoined(true)
-          setGlobalUsers(res.users)
-          setGlobalMessages(res.messages)
-        }
+  // force/done: lets the sender re-establish a lost seat before pushing a message
+  const ensureGlobalJoined = useCallback(
+    (n: string, opts?: { force?: boolean; done?: () => void }) => {
+      const nm = n.trim()
+      const s = socketRef.current
+      if (!s || !nm) return
+      if (globalJoinedRef.current && !opts?.force) {
+        opts?.done?.()
+        return
       }
-    )
-  }, [])
+      s.emit(
+        'join-global',
+        { name: nm, adminToken: adminTokenRef.current ?? undefined },
+        (res: GlobalJoinAck) => {
+          if (res.ok) {
+            globalJoinedRef.current = true
+            setGlobalJoined(true)
+            setGlobalUsers(res.users)
+            setGlobalMessages(res.messages)
+          }
+          opts?.done?.()
+        }
+      )
+    },
+    []
+  )
 
   // ---------- socket ----------
   useEffect(() => {
@@ -471,17 +486,34 @@ export default function ArenaChat() {
       else setTypingNames(names)
     })
 
-    // anti-spam feedback from the server (muted / duplicate)
+    // anti-spam + moderation feedback from the server
     s.on('chat-error', (p: { code?: string; seconds?: number }) => {
       if (p?.code === 'MUTED') {
         toast.error(
           `Slow down! You are muted for ${p.seconds ?? 15}s — too many messages`
         )
+      } else if (p?.code === 'NOT_IN_GLOBAL') {
+        // seat lost (server restart / dropped line) — rejoin silently, no noise
+        ensureGlobalJoined(nameRef.current, { force: true })
+        return
+      } else if (p?.code === 'FROZEN') {
+        toast.error('Global chat is frozen by the Za3im ❄️')
+      } else if (p?.code === 'BANNED') {
+        toast.error('You are banned from the chat 🚫')
       } else {
         toast.error(ERROR_TEXT[p?.code ?? ''] ?? 'Message not sent')
       }
       setInputShake(true)
     })
+
+    // super-admin moderation events
+    s.on('global-cleared', () => setGlobalMessages([]))
+    s.on('message-deleted', (p: { id?: string }) => {
+      const id = p?.id
+      if (!id) return
+      setGlobalMessages((prev) => prev.filter((m) => m.id !== id))
+    })
+    s.on('mod-update', (p: { frozen?: boolean }) => setGlobalFrozen(Boolean(p?.frozen)))
 
     return () => {
       s.disconnect()
@@ -516,19 +548,31 @@ export default function ArenaChat() {
   }
 
   // ---------- sending ----------
-  const sendContent = useCallback((raw: string, scope: ChatTab = 'room') => {
-    const content = raw.trim()
-    const s = socketRef.current
-    if (!content || !s) return
-    s.emit('send-message', { content, scope })
-    setInput('')
-    s.emit('set-typing', { isTyping: false, scope })
-    isTypingRef.current = false
-    if (typingTimerRef.current) {
-      clearTimeout(typingTimerRef.current)
-      typingTimerRef.current = null
-    }
-  }, [])
+  // scope follows the VIEW the user is looking at (not raw tab state), and a
+  // lost global seat is silently re-established before the message goes out
+  const sendContent = useCallback(
+    (raw: string, scope: ChatTab = 'room') => {
+      const content = raw.trim()
+      const s = socketRef.current
+      if (!content || !s) return
+      const push = () => {
+        s.emit('send-message', { content, scope })
+        s.emit('set-typing', { isTyping: false, scope })
+      }
+      if (scope === 'global' && !globalJoinedRef.current) {
+        ensureGlobalJoined(nameRef.current, { force: true, done: push })
+      } else {
+        push()
+      }
+      setInput('')
+      isTypingRef.current = false
+      if (typingTimerRef.current) {
+        clearTimeout(typingTimerRef.current)
+        typingTimerRef.current = null
+      }
+    },
+    [ensureGlobalJoined]
+  )
 
   const onInputChange = (v: string) => {
     setInput(v)
@@ -749,12 +793,74 @@ export default function ArenaChat() {
       } else {
         setAdminError(
           res.error === 'LOCKED'
-            ? 'Too many attempts — locked for 10 minutes'
+            ? 'Too many attempts — locked for one minute'
             : 'Wrong credentials — owner only'
         )
       }
     })
   }
+
+  // ---- super admin: moderation over the owner token ----
+  const adminAction = useCallback(
+    (
+      action: string,
+      extra?: Record<string, unknown>,
+      done?: (res: Record<string, unknown>) => void
+    ) => {
+      const token = adminTokenRef.current
+      if (!token) return
+      socketRef.current?.emit(
+        'admin-action',
+        { action, token, ...extra },
+        (res: Record<string, unknown>) => {
+          if (res?.error === 'ADMIN_STALE') {
+            adminTokenRef.current = null
+            try {
+              localStorage.removeItem(ADMIN_KEY)
+            } catch {
+              /* ignore */
+            }
+            setAdminToken(null)
+            setAdminOpen(true)
+            toast.error('Owner session expired — sign in again 👑')
+            return
+          }
+          done?.(res)
+        }
+      )
+    },
+    []
+  )
+
+  const refreshBans = useCallback(() => {
+    adminAction('list-bans', {}, (res) => {
+      if (res?.ok) {
+        setBans({
+          users: (res.users as string[]) ?? [],
+          ips: (res.ips as string[]) ?? [],
+          onlineIps: res.onlineIps as Record<string, string>,
+        })
+        setGlobalFrozen(Boolean(res.frozen))
+      }
+    })
+  }, [adminAction])
+
+  const openSuperAdmin = useCallback(() => {
+    setAdminOpen(true)
+    refreshBans()
+  }, [refreshBans])
+
+  // emoji picker: closes on any click outside it
+  useEffect(() => {
+    if (!emojiOpen) return
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as HTMLElement | null
+      if (t?.closest?.('[data-emoji-root]')) return
+      setEmojiOpen(false)
+    }
+    document.addEventListener('pointerdown', onDown)
+    return () => document.removeEventListener('pointerdown', onDown)
+  }, [emojiOpen])
 
   const scrollBottom = useCallback((smooth = true) => {
     const el = scrollRef.current
@@ -820,8 +926,9 @@ export default function ArenaChat() {
       onClick={() => !adminBusy && setAdminOpen(false)}
       role="dialog"
       aria-modal="true"
-      aria-label="Owner login"
+      aria-label={adminToken ? 'Super Admin' : 'Owner login'}
     >
+      {!adminToken ? (
       <motion.div
         initial={{ opacity: 0, y: 18, scale: 0.96 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -907,6 +1014,208 @@ export default function ArenaChat() {
           </button>
         </div>
       </motion.div>
+      ) : (
+        <motion.div
+          initial={{ opacity: 0, y: 18, scale: 0.96 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          transition={{ type: 'spring', stiffness: 380, damping: 28 }}
+          onClick={(e) => e.stopPropagation()}
+          className="w-full max-w-md lux-panel rounded-2xl p-5 space-y-4 max-h-[86vh] overflow-y-auto chat-scroll"
+        >
+          <div className="flex items-center gap-3">
+            <div className="relative w-11 h-11 shrink-0">
+              <div className="absolute inset-1 rounded-xl bg-gradient-to-br from-[#f3d27a] via-[#d4af37] to-[#a87f1f] opacity-30 blur-lg" />
+              <div className="relative w-11 h-11 rounded-xl border border-[#d4af37]/45 bg-[#101014] flex items-center justify-center gold-pulse">
+                <Crown className="w-6 h-6 text-[#f3d27a] crown-live fill-amber-400" />
+              </div>
+            </div>
+            <div className="min-w-0 flex-1">
+              <h2 className="font-display text-xl font-bold gold-text tracking-wide">Super Admin</h2>
+              <p className="text-[11px] text-[#8d8878]">Owner tools — only for the Za3im 👑</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAdminOpen(false)}
+              className="h-8 w-8 rounded-lg border border-white/10 bg-[#141419] text-[#8d8878] hover:text-[#e8e2d4] transition-colors shrink-0"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div
+            className={cn(
+              'rounded-xl px-3 py-2 text-xs font-semibold border',
+              globalFrozen
+                ? 'border-sky-400/40 bg-sky-400/10 text-sky-300'
+                : 'border-[#d4af37]/30 bg-[#d4af37]/[0.07] text-[#c9c3b4]'
+            )}
+          >
+            {globalFrozen ? '❄️ Global chat is FROZEN — only you can talk' : '🌍 Global chat is open'} ·{' '}
+            {globalUsers.length} online
+          </div>
+
+          {/* one-tap actions */}
+          <div className="grid grid-cols-2 gap-2">
+            <Button
+              onClick={() => {
+                if (window.confirm('Delete ALL global messages?')) {
+                  adminAction('clear-global', {}, () => toast.success('Global history cleared 🧹'))
+                }
+              }}
+              className="h-10 rounded-xl bg-red-500/15 border border-red-500/40 text-red-300 hover:bg-red-500/25 font-bold text-xs"
+            >
+              🧹 Clear Global
+            </Button>
+            <Button
+              onClick={() =>
+                adminAction(globalFrozen ? 'unfreeze-global' : 'freeze-global', {}, () =>
+                  toast.success(globalFrozen ? 'Global chat unfrozen ☀️' : 'Global chat frozen ❄️')
+                )
+              }
+              className="h-10 rounded-xl bg-sky-500/15 border border-sky-500/40 text-sky-300 hover:bg-sky-500/25 font-bold text-xs"
+            >
+              {globalFrozen ? '☀️ Unfreeze' : '❄️ Freeze Global'}
+            </Button>
+          </div>
+
+          {/* broadcast */}
+          <div className="space-y-1.5">
+            <p className="text-[11px] font-bold uppercase tracking-wider text-[#a8a294]">📢 Broadcast to everyone</p>
+            <div className="flex gap-2">
+              <Input
+                value={bcText}
+                onChange={(e) => setBcText(e.target.value.slice(0, 200))}
+                placeholder="Announcement text..."
+                dir="auto"
+                className="h-10 bg-[#141419] border-[#d4af37]/20"
+              />
+              <Button
+                onClick={() => {
+                  if (!bcText.trim()) return
+                  adminAction('broadcast', { text: bcText.trim() }, () => {
+                    setBcText('')
+                    toast.success('Announcement sent 📢')
+                  })
+                }}
+                className="gold-btn h-10 px-4 rounded-lg border border-[#f3d27a]/40 font-bold text-xs shrink-0"
+              >
+                Send
+              </Button>
+            </div>
+          </div>
+
+          {/* ban user */}
+          <div className="space-y-1.5">
+            <p className="text-[11px] font-bold uppercase tracking-wider text-[#a8a294]">🚫 Ban a user</p>
+            <div className="flex gap-2">
+              <Input
+                value={banName}
+                onChange={(e) => setBanName(e.target.value.slice(0, 20))}
+                placeholder="Exact username..."
+                dir="auto"
+                className="h-10 bg-[#141419] border-[#d4af37]/20"
+              />
+              <Button
+                onClick={() => {
+                  const n = banName.trim()
+                  if (!n) return
+                  adminAction('ban-user', { name: n, alsoIp }, () => {
+                    setBanName('')
+                    toast.success(`${n} banned 🚫`)
+                    refreshBans()
+                  })
+                }}
+                className="gold-btn h-10 px-4 rounded-lg border border-[#f3d27a]/40 font-bold text-xs shrink-0"
+              >
+                Ban
+              </Button>
+            </div>
+            <label className="flex items-center gap-2 text-[11px] text-[#8d8878] cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={alsoIp}
+                onChange={(e) => setAlsoIp(e.target.checked)}
+                className="accent-[#d4af37] w-3.5 h-3.5"
+              />
+              Also ban his IP (blocks the same network)
+            </label>
+          </div>
+
+          {/* ban ip */}
+          <div className="space-y-1.5">
+            <p className="text-[11px] font-bold uppercase tracking-wider text-[#a8a294]">🌐 Ban an IP</p>
+            <div className="flex gap-2">
+              <Input
+                value={banIp}
+                onChange={(e) => setBanIp(e.target.value.trim().slice(0, 45))}
+                placeholder="e.g. 41.62.x.x"
+                dir="ltr"
+                className="h-10 bg-[#141419] border-[#d4af37]/20"
+              />
+              <Button
+                onClick={() => {
+                  const ip = banIp.trim()
+                  if (!ip) return
+                  adminAction('ban-ip', { ip }, () => {
+                    setBanIp('')
+                    toast.success('IP banned 🌐')
+                    refreshBans()
+                  })
+                }}
+                className="gold-btn h-10 px-4 rounded-lg border border-[#f3d27a]/40 font-bold text-xs shrink-0"
+              >
+                Ban
+              </Button>
+            </div>
+          </div>
+
+          {/* bans list */}
+          <div className="space-y-1.5">
+            <p className="text-[11px] font-bold uppercase tracking-wider text-[#a8a294]">📋 Ban list</p>
+            {!bans || (bans.users.length === 0 && bans.ips.length === 0) ? (
+              <p className="text-xs text-[#6d6960]">No bans yet — the lobby is clean ✨</p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {bans.users.map((u) => (
+                  <button
+                    key={`u-${u}`}
+                    type="button"
+                    onClick={() =>
+                      adminAction('unban-user', { name: u }, () => {
+                        toast.success(`${u} unbanned ♻️`)
+                        refreshBans()
+                      })
+                    }
+                    className="rounded-full border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-[11px] text-red-300 hover:border-red-400/60 transition-colors"
+                    title="Click to unban"
+                  >
+                    🚫 {u} ✕
+                  </button>
+                ))}
+                {bans.ips.map((ip) => (
+                  <button
+                    key={`i-${ip}`}
+                    type="button"
+                    onClick={() =>
+                      adminAction('unban-ip', { ip }, () => {
+                        toast.success('IP unbanned ♻️')
+                        refreshBans()
+                      })
+                    }
+                    className="rounded-full border border-orange-500/30 bg-orange-500/10 px-2.5 py-1 text-[11px] text-orange-300 hover:border-orange-400/60 transition-colors"
+                    title="Click to unban"
+                    dir="ltr"
+                  >
+                    🌐 {ip} ✕
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <p className="text-[10px] text-[#5d594e] text-center">Tip: click any banned chip to remove the ban ♻️</p>
+        </motion.div>
+      )}
     </div>
   ) : null
 
@@ -1179,7 +1488,7 @@ export default function ArenaChat() {
               {!adminToken ? (
                 <button
                   type="button"
-                  onClick={() => setAdminOpen(true)}
+                  onClick={openSuperAdmin}
                   className="flex items-center gap-1 hover:text-[#d4af37] transition-colors"
                 >
                   <Crown className="w-3.5 h-3.5 text-[#d4af37]/70" /> Owner login
@@ -1303,8 +1612,8 @@ export default function ArenaChat() {
         {/* Owner */}
         <button
           type="button"
-          onClick={() => setAdminOpen(true)}
-          title={adminToken ? 'Owner of the system 👑' : 'Owner login'}
+          onClick={openSuperAdmin}
+          title={adminToken ? 'Super Admin tools 👑' : 'Owner login'}
           className={cn(
             'h-9 w-9 rounded-lg flex items-center justify-center border transition-colors shrink-0',
             adminToken
@@ -1676,6 +1985,16 @@ export default function ArenaChat() {
                         {m.name}
                       </span>
                       <span className="text-[10px] text-[#5d594e]">{fmtTime(m.ts)}</span>
+                      {adminToken && viewingGlobal && (
+                        <button
+                          type="button"
+                          onClick={() => adminAction('delete-message', { id: m.id })}
+                          title="Delete message"
+                          className="text-[10px] text-[#5d594e] hover:text-red-400 transition-colors"
+                        >
+                          ✕
+                        </button>
+                      )}
                     </div>
                     <div
                       className={cn(
@@ -1745,7 +2064,7 @@ export default function ArenaChat() {
               <button
                 key={q}
                 type="button"
-                onClick={() => sendContent(q, chatTab)}
+                onClick={() => sendContent(q, viewingGlobal ? 'global' : 'room')}
                 className="shrink-0 rounded-full border border-[#d4af37]/20 bg-[#141419] px-3 py-1.5 text-xs font-semibold text-[#c9c3b4] hover:border-[#d4af37]/50 hover:bg-[#d4af37]/10 hover:text-[#d4af37] transition-colors"
               >
                 {q}
@@ -1763,38 +2082,44 @@ export default function ArenaChat() {
                 input.trim() && 'drop-shadow-[0_0_16px_rgba(212,175,55,0.22)]'
               )}
             >
-              <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
-                <PopoverTrigger asChild>
-                  <button
-                    type="button"
-                    title="Emoji"
-                    className="h-10 w-10 shrink-0 rounded-lg border border-[#d4af37]/20 bg-[#141419] text-[#8d8878] hover:text-[#d4af37] hover:border-[#d4af37]/50 flex items-center justify-center transition-colors"
-                  >
-                    <Smile className="w-5 h-5" />
-                  </button>
-                </PopoverTrigger>
-                <PopoverContent side="top" align="end" sideOffset={8} className="w-64 p-2 bg-[#121216] border-[#d4af37]/25">
-                  <div className="grid grid-cols-6 gap-1">
-                    {EMOJIS.map((e) => (
-                      <button
-                        key={e}
-                        type="button"
-                        onClick={() => setInput((prev) => (prev + e).slice(0, 600))}
-                        className="h-9 rounded-lg hover:bg-white/10 text-xl transition-colors"
-                      >
-                        {e}
-                      </button>
-                    ))}
+              <div className="relative shrink-0" data-emoji-root>
+                <button
+                  type="button"
+                  title="Emoji"
+                  onClick={() => setEmojiOpen((v) => !v)}
+                  className={cn(
+                    'h-10 w-10 shrink-0 rounded-lg border flex items-center justify-center transition-colors',
+                    emojiOpen
+                      ? 'border-[#d4af37]/60 bg-[#d4af37]/10 text-[#d4af37]'
+                      : 'border-[#d4af37]/20 bg-[#141419] text-[#8d8878] hover:text-[#d4af37] hover:border-[#d4af37]/50'
+                  )}
+                >
+                  <Smile className="w-5 h-5" />
+                </button>
+                {emojiOpen && (
+                  <div className="emoji-pop absolute bottom-12 right-0 z-40 w-64 rounded-xl border border-[#d4af37]/30 bg-[#121216] p-2 shadow-2xl shadow-black/60">
+                    <div className="grid grid-cols-6 gap-1">
+                      {EMOJIS.map((e) => (
+                        <button
+                          key={e}
+                          type="button"
+                          onClick={() => setInput((prev) => (prev + e).slice(0, 600))}
+                          className="h-9 rounded-lg hover:bg-white/10 text-xl transition-colors"
+                        >
+                          {e}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </PopoverContent>
-              </Popover>
+                )}
+              </div>
               <Input
                 value={input}
                 onChange={(e) => onInputChange(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()
-                    sendContent(input, chatTab)
+                    sendContent(input, viewingGlobal ? 'global' : 'room')
                   }
                 }}
                 placeholder="Type a message... (Enter to send)"
@@ -1814,7 +2139,7 @@ export default function ArenaChat() {
                 className="shrink-0"
               >
                 <Button
-                  onClick={() => sendContent(input, chatTab)}
+                  onClick={() => sendContent(input, viewingGlobal ? 'global' : 'room')}
                   disabled={!input.trim()}
                   size="icon"
                   className="gold-btn h-10 w-10 rounded-lg border border-[#f3d27a]/40 disabled:opacity-40"

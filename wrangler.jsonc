@@ -1,0 +1,15 @@
+{
+  "name": "mg",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-05-01",
+  "workers_dev": true,
+  "assets": {
+    "directory": "out",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "CHAT_HUB", "class_name": "ChatHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChatHub"] }],
+  "observability": { "enabled": true }
+}

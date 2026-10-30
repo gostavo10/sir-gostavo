@@ -129,6 +129,10 @@ export class ChatSocket {
           ack?.(res)
         })
         return
+      case 'admin-action':
+        // super-admin moderation — same global transport, token in the payload
+        this.sendG(ev, d, ack)
+        return
       case 'create-room':
         void this.handleCreate(d, ack)
         return

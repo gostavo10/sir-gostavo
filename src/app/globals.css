@@ -242,3 +242,19 @@ body {
   color: transparent;
   animation: crownShimmer 2.8s linear infinite;
 }
+
+/* emoji picker: instant pop (user asked for a snappy, no-delay open) */
+.emoji-pop {
+  transform-origin: bottom right;
+  animation: emoji-pop 0.08s ease-out both;
+}
+@keyframes emoji-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
