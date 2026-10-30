@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { io, Socket } from 'socket.io-client'
+import { ChatSocket } from '@/lib/chat-socket'
 import { toast } from 'sonner'
 import { AnimatePresence, motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
@@ -227,7 +227,7 @@ export default function ArenaChat() {
   const [adminBusy, setAdminBusy] = useState(false)
   const [adminError, setAdminError] = useState('')
 
-  const socketRef = useRef<Socket | null>(null)
+  const socketRef = useRef<ChatSocket | null>(null)
   const audioCtxRef = useRef<AudioContext | null>(null)
   const myIdRef = useRef<string>('')
   const sessionRef = useRef<Session | null>(null)
@@ -366,28 +366,9 @@ export default function ArenaChat() {
       }
     }
 
-    // Connection target depends on where the app is served:
-    // - z.ai sandbox: the Caddy gateway routes socket traffic to the chat
-    //   service (port 3003) using the XTransformPort query marker.
-    // - external hosting: one unified server (server.js) serves BOTH the
-    //   Next.js app and socket.io on the same origin, default path.
-    const inSandbox =
-      typeof window !== 'undefined' &&
-      (window.location.hostname.endsWith('.space-z.ai') ||
-        window.location.port === '81')
-
-    const socketOpts = {
-      transports: ['websocket', 'polling'] as ('websocket' | 'polling')[],
-      forceNew: true,
-      reconnection: true,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 4000,
-      timeout: 10000,
-    } as const
-
-    const s = inSandbox
-      ? io('/?XTransformPort=3003', socketOpts)
-      : io(window.location.origin, { ...socketOpts, path: '/socket.io' })
+    // Cloudflare Workers build: one same-origin WebSocket to the ChatHub
+    // Durable Object (tiny socket.io-style shim in src/lib/chat-socket.ts).
+    const s = new ChatSocket()
     socketRef.current = s
 
     s.on('connect', () => {
